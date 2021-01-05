@@ -1,0 +1,350 @@
+package net.runelite.client.plugins.vengprompt;
+
+import lombok.extern.slf4j.Slf4j;
+import lombok.Getter;
+import lombok.Setter;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+
+import net.runelite.api.Actor;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.Player;
+import net.runelite.api.Preferences;
+import net.runelite.api.SoundEffectID;
+import net.runelite.api.Varbits;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.events.ActorDeath;
+import net.runelite.api.events.ClientTick;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.OverheadTextChanged;
+import net.runelite.api.events.VarbitChanged;
+
+import net.runelite.client.callback.ClientThread;
+
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+
+
+
+
+import net.runelite.client.util.Text;
+
+import net.runelite.client.events.ConfigChanged;
+
+//coded by Boak
+
+@Slf4j
+@PluginDescriptor(
+        name = "Veng Prompt",
+        description = "Prompts you when someone needs veng",
+        tags = {"veng", "vengeance" , "reminder" , "prompt"},
+        enabledByDefault = true
+)
+public class VengPromptPlugin extends Plugin
+{
+
+    private int vengCooldownVarb = 0;
+    private int isVengeancedVarb = 0;
+    private int initialDelayTimer = 0;
+    private int repeaterCounter = 0;
+    private int highlightCounter = 0;
+    private String username;
+    private boolean playSoundFlag = true;
+    private HashMap<String, Integer> playersToVeng;
+    private Set<String> playerList;
+
+    @Getter private final Map<String, LocalPoint> playerMap = new HashMap<>();
+
+
+    private int initialDelayTimerThreshold;
+    private int repeaterDelayThreshold;
+
+
+    //spellbook stuff
+    private static final int SPELLBOOK_VARBIT = 4070;
+    public int spellbook = 2;   //putting it on lunars by default until a varbit change causes update
+    @Inject
+    @Getter
+    private ClientThread clientThread;
+
+
+    @Inject
+    private Client client;
+    @Inject
+    private VengPromptConfig config;
+
+    @Inject private OverlayManager overlayManager;
+
+    @Inject private VengPromptOverlay overlay;
+
+    @Override
+    protected void startUp() throws Exception
+    {
+        overlayManager.add(overlay);
+        log.info("veng prompt started!");
+        this.playersToVeng = new HashMap<>(100);
+        this.playerList = new HashSet<>(Arrays.asList(config.playerListConfig().split(",")));
+        initialDelayTimerThreshold = config.initialDelayConfig();
+        repeaterDelayThreshold = config.repeaterDelayConfig();
+
+    }
+
+    @Override
+    protected void shutDown() throws Exception
+    {
+        overlayManager.remove(overlay);
+        log.info("veng prompt stopped!");
+        playerMap.clear();
+        playersToVeng.clear();
+    }
+
+    @Provides
+    VengPromptConfig provideConfig (ConfigManager configManager)
+    {
+        return configManager.getConfig(VengPromptConfig.class);
+    }
+
+    @Subscribe
+    public void onVarbitChanged(VarbitChanged event)
+    {
+        vengCooldownVarb = client.getVar(Varbits.VENGEANCE_COOLDOWN);
+        isVengeancedVarb = client.getVar(Varbits.VENGEANCE_ACTIVE);
+
+        if (isVengeancedVarb == 1)
+        {
+            log.debug("isVengeanced");
+            initialDelayTimer = 0;
+        }
+
+
+        //putting spellbook checker here because i dont want it to check on every gametick...
+        spellbook = getCurrentSpellbook();
+        log.debug("Varbit changed... SPELLBOOK VARBIT == " + spellbook);
+
+
+    }
+
+    public int getCurrentSpellbook()
+    {
+        log.debug("isclientthread? ==" + client.isClientThread());
+
+        assert client.isClientThread() : "getCurrentSpellbook must be called on Client Thread";
+        return client.getVarbitValue(SPELLBOOK_VARBIT);
+
+    }
+
+
+    public void repeaterTimer() {
+        repeaterCounter++;
+        log.debug ("repeaterCounter++");
+        if (repeaterCounter == repeaterDelayThreshold){                 //should probably change this to % is factor of. because if you change config it bugs mid
+            playSoundFlag = true;
+            repeaterCounter = 0;
+        }
+    }
+
+    public void highlightTimer() {
+        if (config.highlightPlayers()) {
+            highlightCounter++;
+            log.debug("highlightCounter ++");
+            if (highlightCounter >= config.highlightDuration()) {   //will clear the list once duration has been reached. Resets on next sound played
+                playerMap.clear();
+            } else { //update the playerMap with new coordinates
+                playerMap.clear();
+                log.debug("updating playerMap with new coordinates");
+                for (Player p : this.client.getPlayers()) {
+                    String name = p.getName();
+                    String sName = Text.sanitize(name);
+                    log.debug("sanitizing names");
+                    if (name != null && this.playersToVeng.containsKey(sName)) {
+                        playerMap.putIfAbsent(sName, p.getLocalLocation());
+                        log.debug("putting name on playerMap");
+                    }
+                }
+                log.debug(playerMap.toString());
+            }
+
+        }
+    }
+
+
+
+
+    public void playSound() {
+        // As playSoundEffect only uses the volume argument when the in-game volume isn't muted, sound effect volume
+        // needs to be set to the value desired and afterwards reset to the previous value.
+        Preferences preferences = client.getPreferences();
+        int previousVolume = preferences.getSoundEffectVolume();
+        preferences.setSoundEffectVolume(config.volumeConfig());
+        String username = client.getLocalPlayer().getName();
+
+        //Logic for if you want the prompt for just yourself and also if you want a unique sound. It's ugly but it works.
+        //ONLYME ENABLED
+        if (config.onlyMeConfig() && username != null && playersToVeng.containsKey(username)) {
+            if (config.selfUniqueSound()) {
+                client.playSoundEffect(SoundEffectID.PRAYER_ACTIVATE_RETRIBUTION, config.volumeConfig());
+                log.debug("CONFIG.ONLYME true and SELFUNIQUE true");
+            } else {
+                client.playSoundEffect(SoundEffectID.PRAYER_ACTIVATE_CLARITY_OF_THOUGHT, config.volumeConfig());
+                log.debug("CONFIG.ONLYME true and SELFUNIQUE false");
+            }
+        }
+        //ONLYME DISABLED
+        else{
+                //if selfUniqueSound selected, plugin will play retribution sound for self + clarity for other.
+                //have to include !onlyMeConfig check. otherwise it'll skip to here if your username not on venglist but someone else's is
+                if (!config.onlyMeConfig() && config.selfUniqueSound() && username != null && playersToVeng.containsKey(username)) {
+                    client.playSoundEffect(SoundEffectID.PRAYER_ACTIVATE_RETRIBUTION, config.volumeConfig());
+                    log.debug("CONFIG.ONLYME false and SELFUNIQUE true");
+                    int vengListSize = playersToVeng.size();
+                    if (vengListSize >= 2) {
+                        client.playSoundEffect(SoundEffectID.PRAYER_ACTIVATE_CLARITY_OF_THOUGHT, config.volumeConfig());
+                        log.debug("CONFIG.ONLYME false and SELFUNIQUE true but list contains clarity players");
+                    }
+                } else {
+                    if (!config.onlyMeConfig()){
+                        client.playSoundEffect(SoundEffectID.PRAYER_ACTIVATE_CLARITY_OF_THOUGHT, config.volumeConfig());
+                        log.debug("CONFIG.ONLYME false and SELFUNIQUE false");
+                         }
+                    log.debug("END. if no sound played it means = CONFIG.ONLYME true but you're not on the list");
+                }
+            }
+            preferences.setSoundEffectVolume(previousVolume);
+        }
+
+
+    @Subscribe
+    private void onGameTick(GameTick event) {
+        if(     ((config.disregardVengCooldown() || vengCooldownVarb == 0)
+                && !playersToVeng.isEmpty()
+                && (config.disregardSpellbook() ||   spellbook == 2)))
+        {
+            if (initialDelayTimer >= initialDelayTimerThreshold) {      //the inital delay between someone needing veng and the prompt letting you know
+                repeaterTimer();                          //timer that prevents sound playing every tick. will set playSoundFlag to TRUE when satisfied
+                highlightTimer();
+
+                if (playSoundFlag) {    //this prevents sound playing every tick. playSoundFlag is set to false once sound is played. it's set to true once repeaterTimer(); satisfied
+                    playSoundFlag = false;
+                    playSound();
+                    highlightCounter=0;
+
+                    if (config.addChatMessageConfig()) {
+                        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Players to veng: " + playersToVeng.keySet().toString(), null);
+                    }
+
+                    if (config.highlightPlayers()) {
+                        playerMap.clear();
+                        log.debug("sound played and player map cleared");
+                        for (Player p : this.client.getPlayers()) {
+                            String name = p.getName();
+                            String sName = Text.sanitize(name);
+                            log.debug("sanitizing names");
+                            if (name != null && this.playersToVeng.containsKey(sName)) {
+                                playerMap.putIfAbsent(sName, p.getLocalLocation());
+                                log.debug("putting name on playerMap");
+                            }
+                        }
+                        log.debug(playerMap.toString());
+                    }
+
+
+                }
+
+            } else {    //this activates if there are players to veng + you're off cooldown but there hasn't been a long enough initial delay
+                initialDelayTimer++;
+                log.debug("increment initialDelayTimer");
+                }
+
+        } else {    //if veng is on cooldown or vengList becomes empty then reset internal timers+flags
+            repeaterCounter = 0;
+            initialDelayTimer = 0;
+            playSoundFlag = true;
+            playerMap.clear();
+            highlightCounter = 0;
+            log.debug("BIG RESET, playerMAP cleared, highlightcounter=0");
+            }
+    }
+
+
+
+    @Subscribe
+    public void onOverheadTextChanged(OverheadTextChanged overheadTextChanged) {
+        if (overheadTextChanged.getOverheadText().equals("Taste vengeance!")) {
+            String name = overheadTextChanged.getActor().getName();
+            if ((name != null) && (playerList.contains(name))) {                                  //will add playerToVeng only if they are on config playerList
+                this.playersToVeng.put(Text.sanitize(name), Integer.valueOf(this.client.getTickCount()));
+                log.debug ("adding player to veng list");
+            }
+
+        }
+    }
+
+    @Subscribe
+    public void onClientTick(ClientTick clientTick) {
+        for (Player p : this.client.getPlayers()) {
+            if (p.getGraphic() == 725 || p.getGraphic() == 726) {
+                String name = p.getName();
+                if (name != null) {
+                    String sName = Text.sanitize(name);
+                    if (!this.playersToVeng.containsKey(sName) || ((Integer)this.playersToVeng.get(sName)).intValue() < this.client.getTickCount() - 5){
+                        this.playersToVeng.remove(sName);
+                        log.debug ("removing name from playerToVeng");
+                    }
+                    else{log.debug ("player not on playerToVeng list");}
+                }
+            }
+        }
+    }
+
+    @Subscribe
+    public void onActorDeath(ActorDeath actorDeath) {
+        Actor actor = actorDeath.getActor();
+        if (actor instanceof Player) {
+            Player player = (Player)actor;
+            String name = player.getName();
+            if (name != null) {
+                name = Text.sanitize(name);
+                this.playersToVeng.remove(name);
+            }
+        }
+    }
+
+    @Subscribe
+    public void onGameStateChanged (GameStateChanged gameStateChanged)
+    {
+        if (gameStateChanged.getGameState() == GameState.LOGIN_SCREEN)
+        {
+            playerMap.clear();
+            playersToVeng.clear();
+        }
+    }
+
+    @Subscribe
+    private void onConfigChanged(ConfigChanged event) {
+        if (event.getGroup().equals("vengPrompt"))
+            log.debug("config vengPrompt changed");
+            this.playerList = new HashSet<>(Arrays.asList(config.playerListConfig().split(", ")));
+            log.debug("Player List dump: " + playerList.toString());
+            initialDelayTimerThreshold = config.initialDelayConfig();
+            repeaterDelayThreshold = config.repeaterDelayConfig();
+
+
+    }
+
+    //for ( String key : playersToVeng.keySet() ) { log.debug( key );} //method 00
+    //log.debug(Arrays.asList(playersToVeng)); // method 1
+    //log.debug(Collections.singletonList(playersToVeng)); // method 2
+
+}
