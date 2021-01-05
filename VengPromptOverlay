@@ -1,0 +1,67 @@
+package net.runelite.client.plugins.vengprompt;
+
+import lombok.extern.slf4j.Slf4j;
+import com.google.inject.Provides;
+import net.runelite.api.Client;
+import net.runelite.api.Perspective;
+import net.runelite.api.Point;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+import net.runelite.client.ui.overlay.OverlayUtil;
+import com.google.inject.Provides;
+
+import java.awt.Polygon;
+
+import javax.inject.Inject;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+
+@Slf4j
+public class VengPromptOverlay extends Overlay
+{
+    private final Client client;
+    private final VengPromptPlugin plugin;
+    private final VengPromptConfig config;
+
+    @Inject
+    private VengPromptOverlay(Client client, VengPromptConfig config, VengPromptPlugin plugin)
+    {
+        this.client = client;
+        this.config = config;
+        this.plugin = plugin;
+
+        setPriority(OverlayPriority.HIGH);
+        setPosition(OverlayPosition.DYNAMIC);
+        setLayer(OverlayLayer.ABOVE_SCENE);
+    }
+
+
+    @Override
+    public Dimension render(Graphics2D graphics)
+    {
+
+        if (plugin.getPlayerMap().isEmpty())
+        {
+            log.debug("OVERLAY PLAYERMAP EMPTY");
+            return null;
+        }
+
+        plugin.getPlayerMap().forEach((sName, lp) ->
+        {
+            final Polygon poly = Perspective.getCanvasTileAreaPoly(client, lp, 1);
+
+            if (poly != null) {
+                OverlayUtil.renderPolygon(graphics, poly, config.getHighlightColor());
+                log.debug("RENDER POLY");
+            }
+                else { log.debug("POLY NULL");}
+
+        } );
+
+        return null;
+    }
+}
